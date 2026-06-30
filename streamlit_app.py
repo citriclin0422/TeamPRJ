@@ -1011,6 +1011,101 @@ def load_history(symbol: str | None = None, limit: int = 100) -> pd.DataFrame:
 # ===== 單次查詢總流程 =====
 # 依序抓取 Yahoo、Fintel、MarketBeat、StockCircle，
 # 解析各來源資料、計算 KPI、寫入 SQLite，最後回傳 DataFrame 給 UI 顯示。
+def load_recent_kpi_fallback(symbol: str, codes: tuple[str, ...] = ("02", "03", "04")) -> dict[str, dict[str, Any]]:
+    fallback: dict[str, dict[str, Any]] = {}
+    placeholders = ",".join("?" for _ in codes)
+    if DB_PATH.exists():
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        r.id AS run_id,
+                        r.queried_at,
+                        k.kpi_code,
+                        k.value,
+                        k.display_value,
+                        k.judgement,
+                        k.detail,
+                        k.status
+                    FROM query_runs r
+                    JOIN kpi_results k ON k.run_id = r.id
+                    WHERE UPPER(r.symbol) = ?
+                      AND k.kpi_code IN ({placeholders})
+                      AND k.value IS NOT NULL
+                      AND k.display_value <> 'N/A'
+                      AND k.status IN ('OK', 'yfinance 估算')
+                    ORDER BY
+                        CASE WHEN k.status = 'OK' THEN 1 ELSE 0 END DESC,
+                        datetime(r.queried_at) DESC,
+                        r.id DESC
+                    """,
+                    [symbol.upper(), *codes],
+                ).fetchall()
+            for row in rows:
+                code = row["kpi_code"]
+                if code not in fallback:
+                    fallback[code] = dict(row)
+        except Exception:
+            fallback = {}
+
+    rowdata_path = APP_DIR / "rowdata.csv"
+    if rowdata_path.exists() and len(fallback) < len(codes):
+        try:
+            rowdata = pd.read_csv(rowdata_path, dtype=str, keep_default_na=False)
+            rowdata = rowdata[
+                (rowdata["symbol"].str.upper() == symbol.upper())
+                & (rowdata["kpi_code"].isin(codes))
+                & (rowdata["status"].isin(["OK", "yfinance 估算"]))
+                & (rowdata["value"] != "")
+                & (rowdata["display_value"] != "N/A")
+            ].copy()
+            if not rowdata.empty:
+                rowdata["run_id_sort"] = pd.to_numeric(rowdata["run_id"], errors="coerce").fillna(0)
+                rowdata["status_priority"] = (rowdata["status"] == "OK").astype(int)
+                rowdata = rowdata.sort_values(
+                    ["status_priority", "queried_at", "run_id_sort"],
+                    ascending=[False, False, False],
+                )
+                for _, row in rowdata.iterrows():
+                    code = str(row["kpi_code"]).zfill(2)
+                    if code not in fallback:
+                        fallback[code] = row.to_dict()
+        except Exception:
+            pass
+
+    return fallback
+
+
+def apply_recent_kpi_fallback(symbol: str, rows: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+    fallback = load_recent_kpi_fallback(symbol)
+    applied: list[dict[str, Any]] = []
+    for row in rows:
+        code = row.get("kpi_code")
+        if code not in fallback or row.get("status") == "OK":
+            continue
+        item = fallback[code]
+        row["value"] = safe_float(item.get("value"))
+        row["display_value"] = item.get("display_value") or row["display_value"]
+        row["judgement"] = item.get("judgement") or row["judgement"]
+        row["detail"] = (
+            f"Historical fallback from run_id={item.get('run_id')} "
+            f"queried_at={item.get('queried_at')}; live Fintel status: {reason}; "
+            f"previous detail: {item.get('detail', '')}"
+        )
+        row["status"] = "歷史資料備援"
+        applied.append(
+            {
+                "kpi_code": code,
+                "display_value": row["display_value"],
+                "fallback_run_id": item.get("run_id"),
+                "fallback_queried_at": item.get("queried_at"),
+            }
+        )
+    return applied
+
+
 def run_query(symbol: str, pasted_fintel_text: str = "") -> tuple[int, str, pd.DataFrame, dict[str, Any]]:
     yahoo = fetch_yfinance(symbol)
     fintel_text = pasted_fintel_text.strip()
@@ -1038,10 +1133,14 @@ def run_query(symbol: str, pasted_fintel_text: str = "") -> tuple[int, str, pd.D
         stockcircle_esg,
         stockcircle_status,
     )
+    historical_fallback = []
+    if not fintel_text or any(row["kpi_code"] in {"02", "03", "04"} and row["status"] != "OK" for row in rows):
+        historical_fallback = apply_recent_kpi_fallback(symbol, rows, fintel_status)
     payload = {
         "yfinance": yahoo,
         "fintel": fintel,
         "fintel_status": fintel_status,
+        "historical_kpi_2_4_fallback": historical_fallback,
         "marketbeat_short_interest": marketbeat,
         "marketbeat_status": marketbeat_status,
         "marketbeat_institutional_ownership": marketbeat_ownership,
