@@ -1,5 +1,9 @@
 # Stock KPI Index Dashboard
 
+## LIVE DEMO
+
+[https://team02prj.streamlit.app/](https://team02prj.streamlit.app/)
+
 這個專案是一個可部署到 Streamlit Community Cloud 的股票 KPI 查詢儀表板。使用者輸入股票代號後，系統會整合 Yahoo Finance、Fintel、MarketBeat 與 StockCircle 資料，計算 KPI 1-15，並將查詢結果保存到 SQLite。
 
 ## Streamlit Cloud 部署設定
